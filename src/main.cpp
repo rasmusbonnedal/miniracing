@@ -93,6 +93,11 @@ int main() {
     while (!WindowShouldClose()) {
         const float dt = GetFrameTime();
 		//update physics
+		b3Body_SetAwake(car.chassis_id, true);
+		b3WheelJoint_SetSpinMotorSpeed(car.back_left_id, -car.spinSpeed * 1.0f);
+		b3WheelJoint_SetSpinMotorSpeed(car.back_right_id, -car.spinSpeed * 1.0f);
+
+
 		b3World_Step(world_id, time_step, sub_step_count);
 
         UpdateCamera(&camera, CAMERA_ORBITAL);
@@ -115,8 +120,22 @@ int main() {
                 it++;
             }
         }
-		DrawModel(ground_model, { 0.0f, 0.0f, 0.0f }, 1.0f, RED);
-		DrawModelWires(ground_model, { 0.0f, 0.0f, 0.0f }, 1.0f, DARKGREEN);
+		DrawModel(ground_model, { -20.0f, 0.0f, -20.0f }, 1.0f, RED);
+		DrawModelWires(ground_model, { -20.0f, 0.0f, -20.0f }, 1.0f, DARKGREEN);
+
+		b3Pos chassi_pos = b3Body_GetPosition(car.chassis_id);
+		b3Quat chassi_rot = b3Body_GetRotation(car.chassis_id);
+		float radians;
+		b3Vec3 axis = b3GetAxisAngle(&radians, chassi_rot);
+
+		rlPushMatrix();
+		{
+			rlTranslatef(chassi_pos.x, chassi_pos.y, chassi_pos.z);
+			rlRotatef(radians * RAD2DEG, axis.x, axis.y, axis.z);
+			DrawCube({ 0.0f, 0.0f, 0.0f }, 2.0f, 1.0f, 0.5f, YELLOW);
+		}
+		rlPopMatrix();
+
         EndMode3D();
 
         rlImGuiBegin();
@@ -150,7 +169,7 @@ void create_car_physics(physics_car& car, b3WorldId world_id) {
 	
 
 	{
-		bodyDef.position = { 0.0f, 2.5f, 0.0f };
+		bodyDef.position = { 0.0f, 15.5f, 0.0f };
 		bodyDef.type = b3_dynamicBody;
 		car.chassis_id = b3CreateBody(world_id, &bodyDef);
 
