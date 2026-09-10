@@ -1,11 +1,17 @@
 #include "raylib.h"
+#include "ibl.h"
+#include "specular_ibl.h"
+#include "mesh_normals.h"
+#include <cstdio>
 #include "raymath.h"
 #include "rlgl.h"
 
 #include "rlImGui.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <filesystem>
 #include <format>
@@ -322,7 +328,7 @@ public:
     void draw(int hidden_object = -1, const Vector3* connector_focus = nullptr) const {
         for (const Object& object : objects) {
             if (hidden_object >= 0 && &object == &objects[hidden_object]) continue;
-            DrawModelEx(object.asset->model, object.position, Vector3 { 0.0f, 1.0f, 0.0f },
+            draw_ibl_model(object.asset->model, object.position,
                         object.rotation_degrees, Vector3 { 1.0f, 1.0f, 1.0f }, WHITE);
         }
         if (!connector_focus) return;
@@ -370,6 +376,45 @@ void create_test_physics_ground(const b3WorldId world_id, b3BodyId& ground_id, M
 void create_car_physics(physics_car& car, b3WorldId world_id);
 void create_ground_model(const b3HeightFieldData* data, Model& ground_model);
 
+struct EditorOptions {
+    bool show_red_terrain = true;
+    float exposure_ev = 0.0f;
+    int tone_mapping = 0; // Reinhard, ACES fitted.
+    // Session-only: Debug must always start without the expensive CDF bake.
+#ifdef NDEBUG
+    bool cdf_specular_enabled = true;
+#else
+    bool cdf_specular_enabled = false;
+#endif
+};
+
+void register_editor_settings(EditorOptions& options) {
+    ImGuiSettingsHandler handler;
+    handler.TypeName = "EditorOptions";
+    handler.TypeHash = ImHashStr(handler.TypeName);
+    handler.UserData = &options;
+    handler.ReadOpenFn = [](ImGuiContext*, ImGuiSettingsHandler* handler, const char* name) -> void* {
+        return std::strcmp(name, "Terrain") == 0 ? handler->UserData : nullptr;
+    };
+    handler.ReadLineFn = [](ImGuiContext*, ImGuiSettingsHandler*, void* entry, const char* line) {
+        auto& options = *static_cast<EditorOptions*>(entry);
+        if (std::strcmp(line, "ShowRedTerrain=0") == 0) options.show_red_terrain = false;
+        else if (std::strcmp(line, "ShowRedTerrain=1") == 0) options.show_red_terrain = true;
+        float exposure;
+        int tone_mapping;
+        if (std::sscanf(line, "ExposureEV=%f", &exposure) == 1 && std::isfinite(exposure))
+            options.exposure_ev = std::clamp(exposure, -8.0f, 8.0f);
+        if (std::sscanf(line, "ToneMapping=%d", &tone_mapping) == 1 && tone_mapping >= 0 && tone_mapping <= 1)
+            options.tone_mapping = tone_mapping;
+    };
+    handler.WriteAllFn = [](ImGuiContext*, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buffer) {
+        const auto& options = *static_cast<EditorOptions*>(handler->UserData);
+        buffer->appendf("[EditorOptions][Terrain]\nShowRedTerrain=%d\nExposureEV=%.3f\nToneMapping=%d\n\n",
+            options.show_red_terrain ? 1 : 0, options.exposure_ev, options.tone_mapping);
+    };
+    ImGui::AddSettingsHandler(&handler);
+}
+
 int main() {
     const int screenWidth = 1920;
     const int screenHeight = 1080;
@@ -380,6 +425,27 @@ int main() {
     InitWindow(screenWidth, screenHeight, "Level Editor");
     SetExitKey(KEY_NULL);
     SetTargetFPS(TARGET_FPS);
+    EditorOptions options;
+
+    DiffuseIbl diffuse_ibl;
+    Shader ibl_shader {};
+    if (load_diffuse_ibl(IBL_PATH, diffuse_ibl)) {
+        ibl_shader = load_diffuse_ibl_shader(SHADER_PATH "diffuse_ibl.vs",
+            SHADER_PATH "diffuse_ibl.fs", diffuse_ibl);
+    } else {
+        TraceLog(LOG_WARNING, "IBL: Diffuse environment lighting is unavailable");
+    }
+    SpecularIbl specular_ibl;
+    if (options.cdf_specular_enabled && ibl_shader.id != 0 &&
+        !load_specular_ibl(IBL_PATH, ibl_shader, specular_ibl)) {
+        options.cdf_specular_enabled = false;
+        TraceLog(LOG_WARNING, "IBL: Specular preprocessing failed; using diffuse only");
+    }
+    const auto light_model = [&](Model& model) {
+        if (ibl_shader.id != 0)
+            for (int i = 0; i < model.materialCount; ++i) model.materials[i].shader = ibl_shader;
+        if (specular_ibl.atlas.id != 0) attach_specular_ibl(model, specular_ibl);
+    };
 
     std::map<std::string, ModelAsset> models;
     std::map<std::string, Texture2D> icons;
@@ -393,6 +459,7 @@ int main() {
             if (f.is_regular_file()) {
                 auto& asset = models[f.path().stem().string()];
                 asset.model = LoadModel(f.path().string().c_str());
+                light_model(asset.model);
                 std::print("Analyzing {}\n", f.path().filename().string());
                 asset.connectors = analyze_model(asset.model);
                 asset.bounds = model_bounding_box(asset.model);
@@ -419,6 +486,8 @@ int main() {
     camera.projection = CAMERA_PERSPECTIVE;
 
     rlImGuiSetup(true);
+    // Register before the first frame loads imgui.ini. Keep options alive through shutdown.
+    register_editor_settings(options);
 
 	//Physics world setup
 	b3WorldDef world_def = b3DefaultWorldDef();
@@ -433,6 +502,15 @@ int main() {
 	b3BodyId ground_id;
 	Model ground_model;
 	create_test_physics_ground(world_id, ground_id, ground_model);
+    light_model(ground_model);
+    ground_model.materials[0].maps[MATERIAL_MAP_ROUGHNESS].value = 1.0f;
+    const int exposure_location = ibl_shader.id != 0 ? GetShaderLocation(ibl_shader, "exposureEV") : -1;
+    const int tone_mapping_location = ibl_shader.id != 0 ? GetShaderLocation(ibl_shader, "toneMapping") : -1;
+    const int camera_location = ibl_shader.id != 0 ? GetShaderLocation(ibl_shader, "cameraPosition") : -1;
+    const int specular_enabled_location = ibl_shader.id != 0 ? GetShaderLocation(ibl_shader, "specularEnabled") : -1;
+    Model chassis_model = LoadModelFromMesh(GenMeshCube(2.0f, 1.0f, 0.5f));
+    light_model(chassis_model);
+    chassis_model.materials[0].maps[MATERIAL_MAP_ROUGHNESS].value = 0.5f;
 
 
     while (!WindowShouldClose()) {
@@ -449,6 +527,39 @@ int main() {
         ClearBackground(RAYWHITE);
 
         rlImGuiBegin();
+
+        if (ImGui::Begin("Options")) {
+            if (ImGui::Checkbox("Show red terrain", &options.show_red_terrain)) {
+                ImGui::MarkIniSettingsDirty();
+            }
+            if (ImGui::SliderFloat("Exposure (EV)", &options.exposure_ev, -8.0f, 8.0f, "%.2f"))
+                ImGui::MarkIniSettingsDirty();
+            if (ImGui::Combo("Tone mapping", &options.tone_mapping, "Reinhard\0ACES fitted\0"))
+                ImGui::MarkIniSettingsDirty();
+            ImGui::BeginDisabled(ibl_shader.id == 0);
+            if (ImGui::Button(options.cdf_specular_enabled ? "Disable CDF specular IBL" : "Enable CDF specular IBL")) {
+                if (options.cdf_specular_enabled) {
+                    options.cdf_specular_enabled = false;
+                } else {
+                    if (specular_ibl.atlas.id == 0 && load_specular_ibl(IBL_PATH, ibl_shader, specular_ibl)) {
+                        for (auto& [name, asset] : models) attach_specular_ibl(asset.model, specular_ibl);
+                        attach_specular_ibl(ground_model, specular_ibl);
+                        attach_specular_ibl(chassis_model, specular_ibl);
+                    }
+                    options.cdf_specular_enabled = specular_ibl.atlas.id != 0;
+                }
+            }
+            if (ImGui::IsItemHovered() && specular_ibl.atlas.id == 0)
+                ImGui::SetTooltip("First enable precomputes the environment and may take several seconds.");
+            ImGui::EndDisabled();
+        }
+        ImGui::End();
+        if (ibl_shader.id != 0) {
+            SetShaderValue(ibl_shader, exposure_location, &options.exposure_ev, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(ibl_shader, tone_mapping_location, &options.tone_mapping, SHADER_UNIFORM_INT);
+            const int specular_enabled = options.cdf_specular_enabled ? 1 : 0;
+            SetShaderValue(ibl_shader, specular_enabled_location, &specular_enabled, SHADER_UNIFORM_INT);
+        }
 
         const float mouse_wheel = GetMouseWheelMove();
         if (!ImGui::GetIO().WantCaptureMouse && mouse_wheel != 0.0f) {
@@ -520,6 +631,8 @@ int main() {
             }
         }
 
+        if (ibl_shader.id != 0)
+            SetShaderValue(ibl_shader, camera_location, &camera.position, SHADER_UNIFORM_VEC3);
         BeginMode3D(camera);
         DrawGrid(10, 1.0f);
         const Vector3 connector_focus = has_placement_position
@@ -528,14 +641,15 @@ int main() {
         level.draw(has_placement_position ? moving_object : -1,
             has_placement_position && !selected_asset->connectors.empty() ? &connector_focus : nullptr);
         if (has_placement_position) {
-            DrawModelWiresEx(
-                selected_asset->model, placement_position, Vector3 { 0.0f, 1.0f, 0.0f },
-                placement_rotation_degrees, Vector3 { 1.0f, 1.0f, 1.0f }, snapped ? GREEN : BLUE);
+            draw_ibl_model(selected_asset->model, placement_position,
+                placement_rotation_degrees, Vector3 { 1.0f, 1.0f, 1.0f }, snapped ? GREEN : BLUE, true);
             draw_road_connectors(selected_asset->model, placement_position,
                 placement_rotation_degrees, selected_asset->connectors);
         }
-		DrawModel(ground_model, { -20.0f, 0.0f, -20.0f }, 1.0f, RED);
-		DrawModelWires(ground_model, { -20.0f, 0.0f, -20.0f }, 1.0f, DARKGREEN);
+        if (options.show_red_terrain) {
+            draw_ibl_model(ground_model, { -20.0f, 0.0f, -20.0f }, 0, {1,1,1}, RED);
+            draw_ibl_model(ground_model, { -20.0f, 0.0f, -20.0f }, 0, {1,1,1}, DARKGREEN, true);
+        }
 
 		b3Pos chassi_pos = b3Body_GetPosition(car.chassis_id);
 		b3Quat chassi_rot = b3Body_GetRotation(car.chassis_id);
@@ -546,7 +660,7 @@ int main() {
 		{
 			rlTranslatef(chassi_pos.x, chassi_pos.y, chassi_pos.z);
 			rlRotatef(radians * RAD2DEG, axis.x, axis.y, axis.z);
-			DrawCube({ 0.0f, 0.0f, 0.0f }, 2.0f, 1.0f, 0.5f, YELLOW);
+            draw_ibl_model(chassis_model, Vector3Zero(), 0, {1,1,1}, YELLOW);
 		}
 		rlPopMatrix();
 
@@ -595,8 +709,15 @@ int main() {
         EndDrawing();
     }
 
-    CloseWindow();
     rlImGuiShutdown();
+    UnloadModel(chassis_model);
+    UnloadModel(ground_model);
+    for (auto& [name, asset] : models) UnloadModel(asset.model);
+    for (auto& [name, icon] : icons) UnloadTexture(icon);
+    if (ibl_shader.id != 0) UnloadShader(ibl_shader);
+    if (specular_ibl.atlas.id != 0) UnloadTexture(specular_ibl.atlas);
+    if (specular_ibl.brdf.id != 0) UnloadTexture(specular_ibl.brdf);
+    CloseWindow();
 	b3DestroyWorld(world_id);
     return 0;
 }
@@ -787,6 +908,7 @@ void create_ground_model(const b3HeightFieldData* data, Model &ground_model) {
 			mesh.indices[i_idx++] = current + 1;
 		}
 	}
+    generate_mesh_normals(mesh);
 	UploadMesh(&mesh, false);
 	ground_model = LoadModelFromMesh(mesh);
 	return;

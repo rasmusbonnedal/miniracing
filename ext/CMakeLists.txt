@@ -5,6 +5,7 @@ add_subdirectory(box3d)
 set(BUILD_EXAMPLES OFF CACHE BOOL "Disable raylib examples" FORCE)
 set(BUILD_GAMES OFF CACHE BOOL "Disable raylib games" FORCE)
 add_subdirectory(raylib)
+target_compile_definitions(raylib PRIVATE SUPPORT_FILEFORMAT_HDR=1)
 
 # Dear ImGui
 add_library(imgui_base
