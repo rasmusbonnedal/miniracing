@@ -1,3 +1,11 @@
+add_executable(ssao_test ssao_test.cpp ../src/ssao.cpp)
+target_compile_features(ssao_test PRIVATE cxx_std_23)
+target_include_directories(ssao_test PRIVATE ../src)
+target_link_libraries(ssao_test PRIVATE raylib)
+add_test(NAME ssao COMMAND ssao_test
+    "${CMAKE_SOURCE_DIR}/src/shaders/ssao.fs"
+    "${CMAKE_SOURCE_DIR}/src/shaders/ssao_composite.fs")
+
 add_executable(ibl_test ibl_test.cpp ../src/ibl.cpp)
 target_compile_features(ibl_test PRIVATE cxx_std_23)
 target_include_directories(ibl_test PRIVATE ../src)

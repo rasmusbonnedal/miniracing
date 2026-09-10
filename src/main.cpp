@@ -2,6 +2,7 @@
 #include "ibl.h"
 #include "specular_ibl.h"
 #include "mesh_normals.h"
+#include "ssao.h"
 #include <cstdio>
 #include "raymath.h"
 #include "rlgl.h"
@@ -377,6 +378,9 @@ void create_car_physics(physics_car& car, b3WorldId world_id);
 void create_ground_model(const b3HeightFieldData* data, Model& ground_model);
 
 struct EditorOptions {
+    bool ssao_enabled = true;
+    float ssao_radius = 1.0f;
+    float ssao_strength = 1.0f;
     bool show_red_terrain = true;
     float exposure_ev = 0.0f;
     int tone_mapping = 0; // Reinhard, ACES fitted.
@@ -426,6 +430,8 @@ int main() {
     SetExitKey(KEY_NULL);
     SetTargetFPS(TARGET_FPS);
     EditorOptions options;
+    Ssao ssao;
+    const bool ssao_available = load_ssao(ssao, SHADER_PATH "ssao.fs", SHADER_PATH "ssao_composite.fs");
 
     DiffuseIbl diffuse_ibl;
     Shader ibl_shader {};
@@ -529,6 +535,11 @@ int main() {
         rlImGuiBegin();
 
         if (ImGui::Begin("Options")) {
+            ImGui::BeginDisabled(!ssao_available);
+            ImGui::Checkbox("SSAO", &options.ssao_enabled);
+            ImGui::SliderFloat("AO radius", &options.ssao_radius, 0.1f, 5.0f, "%.2f");
+            ImGui::SliderFloat("AO strength", &options.ssao_strength, 0.0f, 3.0f, "%.2f");
+            ImGui::EndDisabled();
             if (ImGui::Checkbox("Show red terrain", &options.show_red_terrain)) {
                 ImGui::MarkIniSettingsDirty();
             }
@@ -633,7 +644,14 @@ int main() {
 
         if (ibl_shader.id != 0)
             SetShaderValue(ibl_shader, camera_location, &camera.position, SHADER_UNIFORM_VEC3);
+        const bool use_ssao = options.ssao_enabled && ssao_available &&
+            resize_ssao(ssao, GetRenderWidth(), GetRenderHeight());
+        if (use_ssao) {
+            BeginTextureMode(ssao.scene);
+            ClearBackground(RAYWHITE);
+        }
         BeginMode3D(camera);
+        const Matrix scene_projection = rlGetMatrixProjection();
         DrawGrid(10, 1.0f);
         const Vector3 connector_focus = has_placement_position
             ? Vector3Add(placement_position, placement_anchor(*selected_asset, placement_rotation_degrees))
@@ -665,6 +683,10 @@ int main() {
 		rlPopMatrix();
 
         EndMode3D();
+        if (use_ssao) {
+            EndTextureMode();
+            draw_ssao(ssao, scene_projection, options.ssao_radius, options.ssao_strength);
+        }
 
         constexpr float asset_icon_size = 64.0f;
         constexpr float asset_column_count = 2.0f;
@@ -710,6 +732,7 @@ int main() {
     }
 
     rlImGuiShutdown();
+    unload_ssao(ssao);
     UnloadModel(chassis_model);
     UnloadModel(ground_model);
     for (auto& [name, asset] : models) UnloadModel(asset.model);
